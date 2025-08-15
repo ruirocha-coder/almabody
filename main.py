@@ -68,3 +68,16 @@ async def say(req: Request):
     video_url = dj.get("result_url") or dj.get("url") or dj.get("video_url")
 
     return {"answer": answer, "video_url": video_url}
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "message": "Alma D-ID API online",
+        "endpoints": {
+            "health": "/health",
+            "talk": "POST /say  { text, image_url?, voice_id? }"
+        }
+    }
+
+
