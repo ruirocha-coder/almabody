@@ -5,28 +5,39 @@ import requests
 import logging
 import uvicorn
 
-app = FastAPI()
+# ── App & CORS ────────────────────────────────────────────────────────────────
+app = FastAPI(title="almabody")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # restringe ao teu domínio se quiseres
+    allow_origins=["*"],         # afina depois para o teu domínio
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── Logs ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("almabody")
 
-# ── ENV ───────────────────────────────────────────────────────────────────────
-DID_API_KEY   = os.getenv("DID_API_KEY", "").strip()        # ex: key_********************************
-DID_IMAGE_URL = os.getenv("DID_IMAGE_URL", "").strip()      # ex: https://raw.githubusercontent.com/USER/repo/main/avatar.png
-DID_VOICE_ID  = os.getenv("DID_VOICE_ID", "pt-PT-FernandaNeural").strip()  # voz MS (Português)
-# (Opcional) se quiseres passar texto default quando não vem nada
-DEFAULT_TEXT  = os.getenv("DEFAULT_TEXT", "Olá! Sou a Alma, especialista em design de interiores com o método psicoestético. Em que posso ajudar?")
+# ── ENV ──────────────────────────────────────────────────────────────────────
+# DID_API_KEY: cola A TUA CHAVE CRUA (sem "Basic")
+DID_API_KEY   = (os.getenv("DID_API_KEY") or "").strip()
+DID_IMAGE_URL = (os.getenv("DID_IMAGE_URL") or "").strip()  # URL RAW público da imagem
+DID_VOICE_ID  = (os.getenv("DID_VOICE_ID")  or "pt-PT-FernandaNeural").strip()
+DEFAULT_TEXT  = (os.getenv("DEFAULT_TEXT")  or "Olá! Sou a Alma. Em que posso ajudar?").strip()
 
-DID_TALKS_URL = "https://api.d-id.com/talks?wait=true"  # espera o processamento e devolve o vídeo pronto
+DID_TALKS_URL = "https://api.d-id.com/talks?wait=true"  # wait=true → devolve já com video pronto
 
-# ── Health ───────────────────────────────────────────────────────────────────
+def auth_header():
+    """Monta Authorization header no formato exigido pela D-ID."""
+    if not DID_API_KEY:
+        return None
+    # A D-ID espera "Authorization: Basic <API_KEY>"
+    if DID_API_KEY.lower().startswith("basic "):
+        return DID_API_KEY
+    return f"Basic {DID_API_KEY}"
+
+# ── Rotas ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
@@ -40,117 +51,100 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    has_all = bool(DID_API_KEY and DID_IMAGE_URL and DID_VOICE_ID)
+    return {"ok": has_all, "missing": [k for k,v in {
+        "DID_API_KEY": DID_API_KEY,
+        "DID_IMAGE_URL": DID_IMAGE_URL,
+        "DID_VOICE_ID": DID_VOICE_ID,
+    }.items() if not v]}
 
-# ── POST /say → cria vídeo na D-ID a partir de texto ─────────────────────────
 @app.post("/say")
 async def say(request: Request):
     """
-    Body esperado (JSON):
-    {
-      "text": "frase para falar",
-      "image_url": "override opcional",
-      "voice_id": "override opcional (ex: pt-PT-FernandaNeural)"
-    }
+    Body JSON:
+      {
+        "text": "frase a falar",
+        "image_url": "opcional (se quiseres override)",
+        "voice_id": "opcional (ex. pt-PT-FernandaNeural)"
+      }
     Resposta:
-    {
-      "ok": true,
-      "video_url": "...",
-      "talk_id": "...",
-      "raw": {...}  # debug
-    }
+      { "ok": true, "video_url": "https://...", "raw": {...} }
     """
+    # Validar envs
     if not DID_API_KEY:
         return {"ok": False, "error": "Falta DID_API_KEY nas Variables do Railway."}
+    if not DID_IMAGE_URL:
+        return {"ok": False, "error": "Falta DID_IMAGE_URL (link RAW público da imagem)."}
+    if not DID_VOICE_ID:
+        return {"ok": False, "error": "Falta DID_VOICE_ID (ex.: pt-PT-FernandaNeural)."}
 
+    # Ler body
     try:
         body = await request.json()
     except Exception:
         body = {}
 
     text      = (body.get("text") or DEFAULT_TEXT or "").strip()
-    image_url = (body.get("image_url") or DID_IMAGE_URL or "").strip()
-    voice_id  = (body.get("voice_id")  or DID_VOICE_ID or "pt-PT-FernandaNeural").strip()
+    image_url = (body.get("image_url") or DID_IMAGE_URL).strip()
+    voice_id  = (body.get("voice_id")  or DID_VOICE_ID).strip()
 
     if not text:
-        return {"ok": False, "error": "Falta 'text' no body e não há DEFAULT_TEXT definido."}
+        return {"ok": False, "error": "Falta 'text' no body e DEFAULT_TEXT está vazio."}
 
-    if not image_url:
-        return {"ok": False, "error": "Falta 'image_url' e a variável DID_IMAGE_URL não está definida."}
-
-    # Payload EXACTO que a D-ID espera
+    # Payload no formato recomendado (script + voice fora do script)
     payload = {
         "source_url": image_url,
         "script": {
             "type": "text",
-            "subtitles": "false",
-            "provider": {
-                "type": "microsoft",
-                "voice_id": voice_id
-            },
             "input": text
-        }
+        },
+        "voice": {
+            "provider": "microsoft",
+            "voice_id": voice_id
+        },
+        # "config": { "stitch": True }  # opcional
     }
 
     headers = {
-        "Authorization": f"Basic {DID_API_KEY}",
+        "Authorization": auth_header(),
         "Content-Type": "application/json"
     }
+    if not headers["Authorization"]:
+        return {"ok": False, "error": "DID_API_KEY inválida."}
 
     try:
         res = requests.post(DID_TALKS_URL, headers=headers, json=payload, timeout=90)
         status = res.status_code
-        data = {}
         try:
             data = res.json()
         except Exception:
-            pass
+            data = {"_raw_text": res.text}
 
         log.info(f"[D-ID] status={status} body={str(data)[:400]}")
 
-        # Erros típicos
         if status == 401:
             return {
                 "ok": False,
-                "error": "D-ID 401 Unauthorized: verifica DID_API_KEY (copiada sem espaços/aspas) e o cabeçalho Authorization: Basic <API_KEY>.",
+                "error": "D-ID 401 Unauthorized. Confirma a key e que o header é Authorization: Basic <KEY>.",
                 "raw": data
             }
         if status == 400:
-            return {
-                "ok": False,
-                "error": f"D-ID 400 ValidationError: {data}",
-                "raw": data
-            }
+            # Erros de validação (ex.: "'script' is required")
+            return {"ok": False, "error": "D-ID 400 ValidationError", "raw": data}
         if not res.ok:
-            return {
-                "ok": False,
-                "error": f"D-ID error {status}",
-                "raw": data
-            }
+            return {"ok": False, "error": f"D-ID error {status}", "raw": data}
 
-        # Resposta de sucesso da D-ID (quando ?wait=true) traz result_url / video / assets
-        # Em APIs recentes, costuma vir "result_url"; noutros, "video".
+        # D-ID pode responder com 'result_url', 'video', 'video_url'
         video_url = data.get("result_url") or data.get("video") or data.get("video_url")
-
         if not video_url:
-            # fallback para quando devolvem 'id' e assets em nested; devolvemos raw para debug
-            return {
-                "ok": False,
-                "error": "Resposta sem video_url/result_url. Vê 'raw' para o payload devolvido pela D-ID.",
-                "raw": data
-            }
+            return {"ok": False, "error": "Resposta sem video_url/result_url", "raw": data}
 
-        return {
-            "ok": True,
-            "video_url": video_url,
-            "talk_id": data.get("id"),
-            "raw": data
-        }
+        return {"ok": True, "video_url": video_url, "raw": data}
 
     except Exception as e:
-        log.exception("Erro ao chamar a D-ID")
-        return {"ok": False, "error": f"Falha a criar talk: {e}"}
+        log.exception("Erro no /say")
+        return {"ok": False, "error": f"Falha ao criar talk: {e}"}
 
-# ── Local run (opcional) ─────────────────────────────────────────────────────
+# ── Local run (dev) ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
