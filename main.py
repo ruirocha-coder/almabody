@@ -5,79 +5,106 @@ import os, requests, logging
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("alma")
+log = logging.getLogger("almabody")
 
-XAI_API_KEY   = os.getenv("XAI_API_KEY")
-DID_API_KEY   = os.getenv("DID_API_KEY")
-DID_IMAGE_URL = os.getenv("DID_IMAGE_URL")
-DID_VOICE_ID  = os.getenv("DID_VOICE_ID", "Bella")
-
-XAI_URL       = "https://api.x.ai/v1/chat/completions"
-DID_TALKS_URL = "https://api.d-id.com/talks"
+DID_API_KEY  = os.getenv("DID_API_KEY")    # tem de começar por "Basic "
+DID_IMAGE_URL= os.getenv("DID_IMAGE_URL")  # imagem pública (raw github, CDN, etc.)
+DID_VOICE_ID = os.getenv("DID_VOICE_ID")   # ex: pt-PT-FranciscaNeural
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    ok = all([DID_API_KEY, DID_IMAGE_URL, DID_VOICE_ID])
+    return {"ok": ok}
 
 @app.post("/say")
-async def say(req: Request):
-    body = await req.json()
-    user_text = (body.get("text") or "").strip()
-    image_url = (body.get("image_url") or DID_IMAGE_URL or "").strip()
-    voice_id  = (body.get("voice_id")  or DID_VOICE_ID).strip()
+async def say(request: Request):
+    try:
+        data = await request.json()
+        text = (data or {}).get("text", "").strip()
+        if not text:
+            return {"error": "Falta o campo 'text' no JSON."}
 
-    if not user_text:
-        return {"error": "Falta 'text'."}
-    if not XAI_API_KEY:
-        return {"error": "Falta XAI_API_KEY nas Variables."}
-    if not DID_API_KEY:
-        return {"error": "Falta DID_API_KEY nas Variables."}
-    if not image_url:
-        return {"error": "Falta DID_IMAGE_URL (env) ou 'image_url' no body."}
+        # valida envs
+        missing = [k for k,v in {
+            "DID_API_KEY": DID_API_KEY,
+            "DID_IMAGE_URL": DID_IMAGE_URL,
+            "DID_VOICE_ID": DID_VOICE_ID,
+        }.items() if not v]
+        if missing:
+            return {"error": f"Variáveis em falta: {', '.join(missing)}"}
 
-    # 1) Grok-4 → texto em pt-PT
-    g_headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
-    g_payload = {
-        "model": "grok-4-0709",
-        "messages": [
-            {"role": "system", "content": "És a Alma (psicoestético). Responde claro e em pt-PT."},
-            {"role": "user", "content": user_text}
-        ]
-    }
-    g = requests.post(XAI_URL, headers=g_headers, json=g_payload, timeout=40)
-    log.info(f"[xAI] status={g.status_code} body[:160]={g.text[:160]}")
-    g.raise_for_status()
-    answer = g.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip() or "Sem resposta."
+        if not DID_API_KEY.startswith("Basic "):
+            return {"error": "DID_API_KEY deve começar por 'Basic ' (com espaço)."}
 
-    # 2) D-ID Talks → vídeo com o rosto a falar
-    auth = DID_API_KEY if DID_API_KEY.startswith("Bearer ") else f"Bearer {DID_API_KEY}"
-    d_headers = {"Authorization": auth, "Content-Type": "application/json"}
-    d_payload = {
-        "source_url": image_url,
-        "script": {"type": "text", "input": answer, "voice_id": voice_id},
-        "config": {"stitch": True}
-    }
-    d = requests.post(DID_TALKS_URL, headers=d_headers, json=d_payload, timeout=90)
-    log.info(f"[DID] status={d.status_code} body[:160]={d.text[:160]}")
-    d.raise_for_status()
-    dj = d.json()
-    video_url = dj.get("result_url") or dj.get("url") or dj.get("video_url")
-
-    return {"answer": answer, "video_url": video_url}
-
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "message": "Alma D-ID API online",
-        "endpoints": {
-            "health": "/health",
-            "talk": "POST /say  { text, image_url?, voice_id? }"
+        headers = {
+            "Authorization": DID_API_KEY,
+            "Content-Type": "application/json",
         }
-    }
 
+        payload = {
+            "source_url": DID_IMAGE_URL,     # retrato
+            "script": {
+                "type": "text",
+                "input": text
+            },
+            # provider de voz Microsoft + PT-PT
+            "audio": {
+                "provider": "microsoft",
+                "voice_id": DID_VOICE_ID
+            },
+            # configurar saída mp4
+            "config": {
+                "result_format": "mp4",
+                "stitch": True,         # juntar áudio e vídeo
+                "fluent": True,
+                "pad_audio": 0.0
+            }
+        }
 
+        url = "https://api.d-id.com/talks"
+        log.info(f"[D-ID] POST {url} text='{text[:80]}'...")
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        log.info(f"[D-ID] status={r.status_code} body={r.text[:400]}")
+
+        # A API pode devolver 201 ou 200. Parseamos e devolvemos um vídeo URL se existir.
+        if r.status_code >= 400:
+            return {"error": f"D-ID error {r.status_code}", "body": r.text}
+
+        j = {}
+        try:
+            j = r.json()
+        except Exception:
+            # fallback, se vier texto cru
+            return {"error": "Resposta não-JSON da D-ID", "body": r.text}
+
+        # Alguns planos devolvem diretamente 'result_url'/'video_url'; outros devolvem o 'id' para polling.
+        # Tratamos os casos mais comuns:
+        video_url = j.get("result_url") or j.get("video_url")
+
+        if not video_url:
+            # às vezes vem só um 'id' e é preciso pollar /talks/{id}
+            talk_id = j.get("id")
+            if talk_id:
+                poll_url = f"https://api.d-id.com/talks/{talk_id}"
+                for _ in range(20):  # ~20s
+                    pr = requests.get(poll_url, headers=headers, timeout=10)
+                    log.info(f"[D-ID] poll {poll_url} -> {pr.status_code}")
+                    pj = pr.json()
+                    video_url = pj.get("result_url") or pj.get("video_url")
+                    if video_url:
+                        break
+                if not video_url:
+                    return {"error": "Sem video_url após polling", "raw": pj}
+            else:
+                return {"error": "Resposta sem video_url e sem id", "raw": j}
+
+        return {"video_url": video_url}
+
+    except Exception as e:
+        log.exception("Erro no /say")
+        return {"error": f"Exceção no /say: {e}"}
