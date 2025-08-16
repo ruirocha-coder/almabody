@@ -1,110 +1,156 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import os, requests, logging
+import os
+import requests
+import logging
+import uvicorn
 
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],   # restringe ao teu domínio se quiseres
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("almabody")
 
-DID_API_KEY  = os.getenv("DID_API_KEY")    # tem de começar por "Basic "
-DID_IMAGE_URL= os.getenv("DID_IMAGE_URL")  # imagem pública (raw github, CDN, etc.)
-DID_VOICE_ID = os.getenv("DID_VOICE_ID")   # ex: pt-PT-FranciscaNeural
+# ── ENV ───────────────────────────────────────────────────────────────────────
+DID_API_KEY   = os.getenv("DID_API_KEY", "").strip()        # ex: key_********************************
+DID_IMAGE_URL = os.getenv("DID_IMAGE_URL", "").strip()      # ex: https://raw.githubusercontent.com/USER/repo/main/avatar.png
+DID_VOICE_ID  = os.getenv("DID_VOICE_ID", "pt-PT-FernandaNeural").strip()  # voz MS (Português)
+# (Opcional) se quiseres passar texto default quando não vem nada
+DEFAULT_TEXT  = os.getenv("DEFAULT_TEXT", "Olá! Sou a Alma, especialista em design de interiores com o método psicoestético. Em que posso ajudar?")
+
+DID_TALKS_URL = "https://api.d-id.com/talks?wait=true"  # espera o processamento e devolve o vídeo pronto
+
+# ── Health ───────────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "message": "Alma D-ID API online",
+        "endpoints": {
+            "health": "/health",
+            "say": "POST /say  { text, image_url?, voice_id? }"
+        }
+    }
 
 @app.get("/health")
 def health():
-    ok = all([DID_API_KEY, DID_IMAGE_URL, DID_VOICE_ID])
-    return {"ok": ok}
+    return {"ok": True}
 
+# ── POST /say → cria vídeo na D-ID a partir de texto ─────────────────────────
 @app.post("/say")
 async def say(request: Request):
+    """
+    Body esperado (JSON):
+    {
+      "text": "frase para falar",
+      "image_url": "override opcional",
+      "voice_id": "override opcional (ex: pt-PT-FernandaNeural)"
+    }
+    Resposta:
+    {
+      "ok": true,
+      "video_url": "...",
+      "talk_id": "...",
+      "raw": {...}  # debug
+    }
+    """
+    if not DID_API_KEY:
+        return {"ok": False, "error": "Falta DID_API_KEY nas Variables do Railway."}
+
     try:
-        data = await request.json()
-        text = (data or {}).get("text", "").strip()
-        if not text:
-            return {"error": "Falta o campo 'text' no JSON."}
+        body = await request.json()
+    except Exception:
+        body = {}
 
-        # valida envs
-        missing = [k for k,v in {
-            "DID_API_KEY": DID_API_KEY,
-            "DID_IMAGE_URL": DID_IMAGE_URL,
-            "DID_VOICE_ID": DID_VOICE_ID,
-        }.items() if not v]
-        if missing:
-            return {"error": f"Variáveis em falta: {', '.join(missing)}"}
+    text      = (body.get("text") or DEFAULT_TEXT or "").strip()
+    image_url = (body.get("image_url") or DID_IMAGE_URL or "").strip()
+    voice_id  = (body.get("voice_id")  or DID_VOICE_ID or "pt-PT-FernandaNeural").strip()
 
-        if not DID_API_KEY.startswith("Basic "):
-            return {"error": "DID_API_KEY deve começar por 'Basic ' (com espaço)."}
+    if not text:
+        return {"ok": False, "error": "Falta 'text' no body e não há DEFAULT_TEXT definido."}
 
-        headers = {
-            "Authorization": DID_API_KEY,
-            "Content-Type": "application/json",
-        }
+    if not image_url:
+        return {"ok": False, "error": "Falta 'image_url' e a variável DID_IMAGE_URL não está definida."}
 
-        payload = {
-            "source_url": DID_IMAGE_URL,     # retrato
-            "script": {
-                "type": "text",
-                "input": text
+    # Payload EXACTO que a D-ID espera
+    payload = {
+        "source_url": image_url,
+        "script": {
+            "type": "text",
+            "subtitles": "false",
+            "provider": {
+                "type": "microsoft",
+                "voice_id": voice_id
             },
-            # provider de voz Microsoft + PT-PT
-            "audio": {
-                "provider": "microsoft",
-                "voice_id": DID_VOICE_ID
-            },
-            # configurar saída mp4
-            "config": {
-                "result_format": "mp4",
-                "stitch": True,         # juntar áudio e vídeo
-                "fluent": True,
-                "pad_audio": 0.0
-            }
+            "input": text
         }
+    }
 
-        url = "https://api.d-id.com/talks"
-        log.info(f"[D-ID] POST {url} text='{text[:80]}'...")
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        log.info(f"[D-ID] status={r.status_code} body={r.text[:400]}")
+    headers = {
+        "Authorization": f"Basic {DID_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-        # A API pode devolver 201 ou 200. Parseamos e devolvemos um vídeo URL se existir.
-        if r.status_code >= 400:
-            return {"error": f"D-ID error {r.status_code}", "body": r.text}
-
-        j = {}
+    try:
+        res = requests.post(DID_TALKS_URL, headers=headers, json=payload, timeout=90)
+        status = res.status_code
+        data = {}
         try:
-            j = r.json()
+            data = res.json()
         except Exception:
-            # fallback, se vier texto cru
-            return {"error": "Resposta não-JSON da D-ID", "body": r.text}
+            pass
 
-        # Alguns planos devolvem diretamente 'result_url'/'video_url'; outros devolvem o 'id' para polling.
-        # Tratamos os casos mais comuns:
-        video_url = j.get("result_url") or j.get("video_url")
+        log.info(f"[D-ID] status={status} body={str(data)[:400]}")
+
+        # Erros típicos
+        if status == 401:
+            return {
+                "ok": False,
+                "error": "D-ID 401 Unauthorized: verifica DID_API_KEY (copiada sem espaços/aspas) e o cabeçalho Authorization: Basic <API_KEY>.",
+                "raw": data
+            }
+        if status == 400:
+            return {
+                "ok": False,
+                "error": f"D-ID 400 ValidationError: {data}",
+                "raw": data
+            }
+        if not res.ok:
+            return {
+                "ok": False,
+                "error": f"D-ID error {status}",
+                "raw": data
+            }
+
+        # Resposta de sucesso da D-ID (quando ?wait=true) traz result_url / video / assets
+        # Em APIs recentes, costuma vir "result_url"; noutros, "video".
+        video_url = data.get("result_url") or data.get("video") or data.get("video_url")
 
         if not video_url:
-            # às vezes vem só um 'id' e é preciso pollar /talks/{id}
-            talk_id = j.get("id")
-            if talk_id:
-                poll_url = f"https://api.d-id.com/talks/{talk_id}"
-                for _ in range(20):  # ~20s
-                    pr = requests.get(poll_url, headers=headers, timeout=10)
-                    log.info(f"[D-ID] poll {poll_url} -> {pr.status_code}")
-                    pj = pr.json()
-                    video_url = pj.get("result_url") or pj.get("video_url")
-                    if video_url:
-                        break
-                if not video_url:
-                    return {"error": "Sem video_url após polling", "raw": pj}
-            else:
-                return {"error": "Resposta sem video_url e sem id", "raw": j}
+            # fallback para quando devolvem 'id' e assets em nested; devolvemos raw para debug
+            return {
+                "ok": False,
+                "error": "Resposta sem video_url/result_url. Vê 'raw' para o payload devolvido pela D-ID.",
+                "raw": data
+            }
 
-        return {"video_url": video_url}
+        return {
+            "ok": True,
+            "video_url": video_url,
+            "talk_id": data.get("id"),
+            "raw": data
+        }
 
     except Exception as e:
-        log.exception("Erro no /say")
-        return {"error": f"Exceção no /say: {e}"}
+        log.exception("Erro ao chamar a D-ID")
+        return {"ok": False, "error": f"Falha a criar talk: {e}"}
+
+# ── Local run (opcional) ─────────────────────────────────────────────────────
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
